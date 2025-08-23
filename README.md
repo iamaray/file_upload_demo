@@ -1,2 +1,2 @@
-# file_upload_demo
-A toy project wherein I am experimenting with some file upload logic.
+# File Upload Demo (Golang + TypeScript)
+A toy project... experimenting with some file upload logic.
