@@ -20,43 +20,61 @@ import (
 
 const (
 	maxUploadBytes = 200 << 20
-	uploadDir	   = "./data/uploads"
+	uploadDir      = "./data/uploads"
 )
 
 type UploadResponse struct {
-	ID			string `json:"id"`
-	Bytes   	int64  `json:"bytesWritten"`
+	ID          string `json:"id"`
+	Bytes       int64  `json:"bytesWritten"`
 	ChecksumSHA string `json:"sha256"`
 	ContentType string `json:"contentType"`
-	Filename	string `json:"filename"`
+	Filename    string `json:"filename"`
+}
+
+type ErrorResponse struct {
+	Error   string `json:"error"`
+	Message string `json:"message"`
+	Code    int    `json:"code"`
 }
 
 func UploadHandler() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
+			writeMethodNotAllowed(w, "Only POST method is allowed for file uploads")
 			return
 		}
-		
+
 		r.Body = http.MaxBytesReader(w, r.Body, maxUploadBytes)
-		
-		mr, err := r.MultipartReader() 
+
+		mr, err := r.MultipartReader()
 		if err != nil {
+			writeBadRequest(w, "Invalid multipart form data")
 			return
 		}
 
 		id, err := randomHex(16)
 		if err != nil {
+			writeInternalError(w, "Failed to generate file ID")
 			return
 		}
 
 		part, err := mpProc(mr)
 		if err != nil {
+			if errors.Is(err, http.ErrMissingFile) {
+				writeBadRequest(w, "No file provided in 'file' field")
+			} else if err.Error() == "no filename provided" {
+				writeBadRequest(w, "No filename provided for uploaded file")
+			} else {
+				writeBadRequest(w, "Error processing multipart data: "+err.Error())
+			}
 			return
 		}
+		defer part.Close()
 
 		now := time.Now()
 		dir := filepath.Join(uploadDir, now.Format("2006"), now.Format("01"))
 		if err := os.MkdirAll(dir, 0o755); err != nil {
+			writeInternalError(w, "Failed to create upload directory")
 			return
 		}
 
@@ -65,6 +83,7 @@ func UploadHandler() http.HandlerFunc {
 
 		dstFile, err := os.OpenFile(tmpPath, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o644)
 		if err != nil {
+			writeInternalError(w, "Failed to create temporary file")
 			return
 		}
 
@@ -81,8 +100,15 @@ func UploadHandler() http.HandlerFunc {
 		nHead, _ := io.ReadFull(part, head)
 		head = head[:nHead]
 		contentType := http.DetectContentType(pad512(head))
-		if !isAllowedCSV(contentType, part.Part.FileName()) {
-			return 
+		filename := part.Part.FileName()
+		if !isAllowedCSV(contentType, filename) {
+			ext := strings.ToLower(filepath.Ext(filename))
+			if ext != ".csv" {
+				writeUnsupportedMediaType(w, "Only CSV files are allowed. File extension '"+ext+"' is not supported")
+			} else {
+				writeUnsupportedMediaType(w, "File content type '"+contentType+"' is not supported for CSV files")
+			}
+			return
 		}
 
 		h := sha256.New()
@@ -91,6 +117,7 @@ func UploadHandler() http.HandlerFunc {
 		var written int64
 		if nHead > 0 {
 			if _, err := mw.Write(head); err != nil {
+				writeInternalError(w, "Failed to write file data")
 				return
 			}
 			written += int64(nHead)
@@ -100,20 +127,39 @@ func UploadHandler() http.HandlerFunc {
 		written += n
 		if err != nil {
 			if !errors.Is(err, io.EOF) {
+				if strings.Contains(err.Error(), "request body too large") {
+					writeRequestEntityTooLarge(w, "File size exceeds maximum allowed size of 200MB")
+				} else {
+					writeInternalError(w, "Failed to copy file data")
+				}
 				return
 			}
 		}
 
-		if err := bufWriter.Flush(); err != nil { return }
-		if err := dstFile.Close(); err != nil { return }
-		if err := os.Rename(tmpPath, finalPath); err != nil { return }
+		if written == 0 {
+			writeBadRequest(w, "Uploaded file is empty")
+			return
+		}
+
+		if err := bufWriter.Flush(); err != nil {
+			writeInternalError(w, "Failed to flush file buffer")
+			return
+		}
+		if err := dstFile.Close(); err != nil {
+			writeInternalError(w, "Failed to close file")
+			return
+		}
+		if err := os.Rename(tmpPath, finalPath); err != nil {
+			writeInternalError(w, "Failed to finalize file")
+			return
+		}
 
 		resp := UploadResponse{
-			ID:	id,
-			Bytes: written,
+			ID:          id,
+			Bytes:       written,
 			ChecksumSHA: hex.EncodeToString(h.Sum(nil)),
 			ContentType: contentType,
-			Filename: filepath.Base(finalPath),
+			Filename:    filepath.Base(finalPath),
 		}
 		writeJSON(w, http.StatusOK, resp)
 	}
@@ -124,7 +170,6 @@ type multipartPart struct {
 }
 
 func mpProc(mr *multipart.Reader) (*multipartPart, error) {
-	var part *multipartPart
 	for {
 		p, perr := mr.NextPart()
 		if errors.Is(perr, io.EOF) {
@@ -136,16 +181,15 @@ func mpProc(mr *multipart.Reader) (*multipartPart, error) {
 		}
 
 		if p.FormName() == "file" {
-			part = &multipartPart{Part: p}
-			defer p.Close()
-			break
+			if p.FileName() == "" {
+				p.Close()
+				return &multipartPart{Part: nil}, errors.New("no filename provided")
+			}
+			return &multipartPart{Part: p}, nil
 		}
 		_ = p.Close()
 	}
-	if part == nil {
-		return &multipartPart{Part: nil}, http.ErrBodyNotAllowed
-	}
-	return part, nil
+	return &multipartPart{Part: nil}, http.ErrMissingFile
 }
 
 func randomHex(nBytes int) (string, error) {
@@ -167,14 +211,17 @@ func pad512(b []byte) []byte {
 }
 
 func isAllowedCSV(contentType, filename string) bool {
+	ext := strings.ToLower(filepath.Ext(filename))
+	if ext != ".csv" {
+		return false
+	}
+
 	switch contentType {
 	case "text/csv", "application/vnd.ms-excel", "text/plain", "application/octet-stream":
+		return true
 	default:
 		return false
 	}
-	ext := strings.ToLower(filepath.Ext(filename))
-	return ext == ".csv"
-
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {
@@ -183,14 +230,43 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	_ = json.NewEncoder(w).Encode(v)
 }
 
+func writeError(w http.ResponseWriter, status int, errorType, message string) {
+	errResp := ErrorResponse{
+		Error:   errorType,
+		Message: message,
+		Code:    status,
+	}
+	writeJSON(w, status, errResp)
+}
+
+func writeInternalError(w http.ResponseWriter, message string) {
+	writeError(w, http.StatusInternalServerError, "internal_server_error", message)
+}
+
+func writeBadRequest(w http.ResponseWriter, message string) {
+	writeError(w, http.StatusBadRequest, "bad_request", message)
+}
+
+func writeUnsupportedMediaType(w http.ResponseWriter, message string) {
+	writeError(w, http.StatusUnsupportedMediaType, "unsupported_media_type", message)
+}
+
+func writeMethodNotAllowed(w http.ResponseWriter, message string) {
+	writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", message)
+}
+
+func writeRequestEntityTooLarge(w http.ResponseWriter, message string) {
+	writeError(w, http.StatusRequestEntityTooLarge, "request_entity_too_large", message)
+}
+
 func main() {
 	mux := http.NewServeMux()
-	mux.HandleFunc("v1/files", UploadHandler())
+	mux.HandleFunc("/v1/files/", UploadHandler())
 
 	srv := &http.Server{
-		Addr: ":8080",
-		Handler: mux,
-		ReadTimeout: 60 * time.Second,
+		Addr:         ":8080",
+		Handler:      mux,
+		ReadTimeout:  60 * time.Second,
 		WriteTimeout: 60 * time.Second,
 	}
 	log.Println("listening on :8080")
