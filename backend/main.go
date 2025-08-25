@@ -9,12 +9,13 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"log"
+	"mime/multipart"
 	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
 	"time"
-	"mime/multipart"
 )
 
 const (
@@ -185,4 +186,13 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 func main() {
 	mux := http.NewServeMux()
 	mux.HandleFunc("v1/files", UploadHandler())
+
+	srv := &http.Server{
+		Addr: ":8080",
+		Handler: mux,
+		ReadTimeout: 60 * time.Second,
+		WriteTimeout: 60 * time.Second,
+	}
+	log.Println("listening on :8080")
+	log.Fatal(srv.ListenAndServe())
 }
