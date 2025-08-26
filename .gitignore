@@ -33,3 +33,4 @@ go.work.sum
 
 # ignore everything in data
 data/
+testing/test_data/
